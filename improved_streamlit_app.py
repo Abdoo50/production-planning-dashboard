@@ -8,8 +8,13 @@ from datetime import datetime, timedelta
 import warnings
 import io
 import os
+import re
 import time
 from sit_date_classifier import SITDateClassifier
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill
+from openpyxl.formatting.rule import CellIsRule
+
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -80,6 +85,16 @@ def handle_errors(func):
             return None
     return wrapper
 
+def _canon_code_str(x) -> str:
+    """To a clean text code: strip, and remove trailing .0 from floats read from Excel."""
+    s = str(x).strip()
+    return re.sub(r"\.0+$", "", s)
+
+def _canon_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
+
+EXCLUDED_RM_CMMF = {_canon_code_str(x) for x in EXCLUDED_RM_CMMF}
+
 # Title
 st.title("📊 Production Planning Dashboard")
 st.markdown("---")
@@ -132,6 +147,13 @@ filter_year = st.sidebar.selectbox(
     ["All", 2025, 2024, 2026],
     help="Select 'All' to include all years without filtering"
 )
+
+# --- Market filter (BOM) ---
+st.sidebar.header("🔎 Market Filter (BOM)")
+chk_market_imported = st.sidebar.checkbox("Imported", value=True)
+chk_market_local = st.sidebar.checkbox("Local", value=True)
+chk_market_inhouse = st.sidebar.checkbox("In House", value=True)
+
 
 # Process button
 process_data = st.sidebar.button("🚀 Run Analysis", type="primary")
@@ -189,6 +211,29 @@ if st.session_state.analysis_completed:
         st.session_state.processing_status = ""
         st.rerun()
 
+
+def _xl_format_columns(ws, header_to_fmt: dict):
+    """Apply number formats by column header name on the first row."""
+    header_map = {cell.value: get_column_letter(cell.column) for cell in ws[1] if cell.value}
+    for header, num_fmt in header_to_fmt.items():
+        col_letter = header_map.get(header)
+        if not col_letter:
+            continue
+        for r in range(2, ws.max_row + 1):
+            ws[f"{col_letter}{r}"].number_format = num_fmt
+
+def _xl_highlight_negative(ws, header_name: str, fill: PatternFill = None):
+    """Highlight negative numbers ( < 0 ) in a given header column."""
+    if fill is None:
+        fill = PatternFill(fill_type="solid", start_color="FFFF00", end_color="FFFF00")  # Yellow
+    header_map = {cell.value: get_column_letter(cell.column) for cell in ws[1] if cell.value}
+    col_letter = header_map.get(header_name)
+    if not col_letter:
+        return
+    rng = f"{col_letter}2:{col_letter}{ws.max_row}"
+    ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=fill))
+
+
 # ==============================================================================
 # EXACT FUNCTIONS FROM PASTED_CONTENT SCRIPTS (with enhanced error handling)
 # ==============================================================================
@@ -218,6 +263,11 @@ def load_and_clean_bom(file_obj):
         bom_data[col] = pd.to_numeric(bom_data[col], errors='coerce').fillna(0)
     
     st.success(f"BOM data cleaned. Working with all {bom_data.shape[0]} rows.")
+
+    # Ensure codes are canonical strings for consistent joins and isin()
+    bom_data["RM CMMF"] = _canon_series(bom_data["RM CMMF"])
+    bom_data["F.G. CMMF"] = _canon_series(bom_data["F.G. CMMF"])
+
     return bom_data
 
 @handle_errors
@@ -519,6 +569,7 @@ def process_all_sit_sources_streamlit(sit_files, filter_month, filter_year):
     # Perform the final groupby and sum
     final_grouped_data = final_sit_data.groupby('RM CMMF', as_index=False)['SIT Quantity'].sum()
     
+    final_grouped_data["RM CMMF"] = _canon_series(final_grouped_data["RM CMMF"])
     return final_grouped_data
 
 @handle_errors
@@ -543,6 +594,9 @@ def load_target_plan(file_obj):
                 if fg_col and "Forecast July 25" in target_df.columns:
                     target_plan = target_df.set_index(fg_col)["Forecast July 25"].to_dict()
                     st.success(f"Loaded target plan from sheet '{sheet_name}' using 'Forecast July 25' with {len(target_plan)} targets")
+
+                    # Canonicalize keys to match BOM FG codes
+                    target_plan = {_canon_code_str(k): int(v) for k, v in target_plan.items() if pd.notna(v)}
                     return target_plan
                 
             except Exception as e:
@@ -562,11 +616,14 @@ def create_excel_output_with_target(fg_summary, bottleneck_analysis, family_summ
     Excel export for 'With Target'.
     - Original: sheet names have no suffix.
     - With SIT / What-If: sheet names end with '_sit'.
-    - No Dev sheet.
     - Hide *_sit/*_sim requirement/surplus columns for non-Original downloads.
+    - Apply Excel number formats + conditional formatting.
     """
     output_buffer = io.BytesIO()
     sheet_sfx = "" if data_view_type == "Original" else "_sit"
+
+    INT_FMT = '#,##0'
+    EGP_FMT = '#,##0" ج.م.‏"'
 
     _hide_non_original = {
         "Required RM for Max Production_sit",
@@ -576,26 +633,67 @@ def create_excel_output_with_target(fg_summary, bottleneck_analysis, family_summ
     }
 
     with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-        # 1) FG View
-        fg_summary.to_excel(writer, sheet_name=f"Amiras_FG_View{sheet_sfx}", index=False)
+        # ---- 1) FG View (write first, then format)
+        fg_sheet_name = f"Amiras_FG_View{sheet_sfx}"
+        fg_summary.to_excel(writer, sheet_name=fg_sheet_name, index=False)
+        ws_fg = writer.sheets[fg_sheet_name]
 
-        # 2) Bottleneck Analysis (clean for non-Original)
+        # number formats in FG view
+        _xl_format_columns(ws_fg, {
+            "RMAT Stock QTY": INT_FMT,
+            "incomplete set QTY": INT_FMT,
+            "Stock Value EGP": EGP_FMT,
+            "incomplete Set Value": EGP_FMT,
+        })
+
+        # ---- 2) Bottleneck Analysis (clean, add helper value cols, cast ints, write, then format)
         ba = bottleneck_analysis.copy()
-        if data_view_type != "Original":
-            ba = ba.drop(columns=[c for c in _hide_non_original if c in ba.columns], errors="ignore")
 
-        # Helper value (no 'In Stock after SIT')
+        # ⬇️ to this:
+        if data_view_type == "Original":
+            # Hide these two in the Original (With Target) file
+            ba = ba.drop(
+                columns=["Required RM for Max Production", "RM Surplus after Production"],
+                errors="ignore"
+            )
+        else:
+            # Existing behavior for With SIT / What-If
+            ba = ba.drop(
+                columns=[c for c in _hide_non_original if c in ba.columns],
+                errors="ignore"
+            )
+
+        # helper value cols (currency)
         if "FG Units Possible_sit" in ba.columns and "RM Value" in ba.columns:
             ba["FG Units Possible_sit Value"] = ba["FG Units Possible_sit"] * ba["RM Value"]
-        elif "FG Units Possible" in ba.columns and "RM Value" in ba.columns:
+        if "FG Units Possible" in ba.columns and "RM Value" in ba.columns and "FG Units Possible Value" not in ba.columns:
             ba["FG Units Possible Value"] = ba["FG Units Possible"] * ba["RM Value"]
 
-        ba.to_excel(writer, sheet_name=f"Bottleneck_Analysis{sheet_sfx}", index=False)
+        # Surplus/Shortage vs Target as int (not float)
+        if "Surplus/Shortage vs Target" in ba.columns:
+            ba["Surplus/Shortage vs Target"] = pd.to_numeric(ba["Surplus/Shortage vs Target"], errors="coerce").fillna(0).astype(int)
 
-        # 3) Family Summary
-        family_summary.to_excel(writer, sheet_name=f"Family_Summary{sheet_sfx}", index=False)
+        ba_sheet_name = f"Bottleneck_Analysis{sheet_sfx}"
+        ba.to_excel(writer, sheet_name=ba_sheet_name, index=False)
+        ws_ba = writer.sheets[ba_sheet_name]
+
+        # number formats in Bottleneck Analysis
+        header_to_fmt = {
+            "FG Units Possible Value": EGP_FMT,
+            "FG Units Possible_sit Value": EGP_FMT,
+            "Surplus/Shortage vs Target": INT_FMT,
+        }
+        _xl_format_columns(ws_ba, header_to_fmt)
+
+        # highlight negative target gaps
+        _xl_highlight_negative(ws_ba, "Surplus/Shortage vs Target")
+
+        # ---- 3) Family Summary (no special formatting requested)
+        fam_sheet_name = f"Family_Summary{sheet_sfx}"
+        family_summary.to_excel(writer, sheet_name=fam_sheet_name, index=False)
 
     return output_buffer.getvalue()
+
 
 
 @handle_errors
@@ -605,9 +703,13 @@ def create_excel_output_without_target(fg_summary, bottleneck_analysis, family_s
     - Original: sheet names have no suffix.
     - With SIT / What-If: sheet names end with '_sit'.
     - Hide *_sit/*_sim requirement/surplus columns for non-Original downloads.
+    - Apply Excel number formats + conditional formatting (if target column exists).
     """
     output_buffer = io.BytesIO()
     sheet_sfx = "" if data_view_type == "Original" else "_sit"
+
+    INT_FMT = '#,##0'
+    EGP_FMT = '#,##0" ج.م.‏"'
 
     _hide_non_original = {
         "Required RM for Max Production_sit",
@@ -617,16 +719,63 @@ def create_excel_output_without_target(fg_summary, bottleneck_analysis, family_s
     }
 
     with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-        fg_summary.to_excel(writer, sheet_name=f"Amiras_FG_View{sheet_sfx}", index=False)
+        # ---- 1) FG View
+        fg_sheet_name = f"Amiras_FG_View{sheet_sfx}"
+        fg_summary.to_excel(writer, sheet_name=fg_sheet_name, index=False)
+        ws_fg = writer.sheets[fg_sheet_name]
 
+        _xl_format_columns(ws_fg, {
+            "RMAT Stock QTY": INT_FMT,
+            "incomplete set QTY": INT_FMT,
+            "Stock Value EGP": EGP_FMT,
+            "incomplete Set Value": EGP_FMT,
+        })
+
+        # ---- 2) Bottleneck Analysis
         ba = bottleneck_analysis.copy()
         if data_view_type != "Original":
             ba = ba.drop(columns=[c for c in _hide_non_original if c in ba.columns], errors="ignore")
-        ba.to_excel(writer, sheet_name=f"Bottleneck_Analysis{sheet_sfx}", index=False)
 
-        family_summary.to_excel(writer, sheet_name=f"Family_Summary{sheet_sfx}", index=False)
+        # Add helper value columns here too (so we can format them as currency)
+        if "FG Units Possible_sit" in ba.columns and "RM Value" in ba.columns:
+            ba["FG Units Possible_sit Value"] = ba["FG Units Possible_sit"] * ba["RM Value"]
+        if "FG Units Possible" in ba.columns and "RM Value" in ba.columns and "FG Units Possible Value" not in ba.columns:
+            ba["FG Units Possible Value"] = ba["FG Units Possible"] * ba["RM Value"]
+
+        # Cast Surplus/Shortage vs Target to int if it exists (sometimes present via earlier steps)
+        if "Surplus/Shortage vs Target" in ba.columns:
+            ba["Surplus/Shortage vs Target"] = pd.to_numeric(ba["Surplus/Shortage vs Target"], errors="coerce").fillna(0).astype(int)
+
+        # NEW ➜ Cast RM Surplus after Production (both views) to int
+        surplus_cols = [c for c in ["RM Surplus after Production", "RM Surplus after Production_sit"] if c in ba.columns]
+        for c in surplus_cols:
+            ba[c] = pd.to_numeric(ba[c], errors="coerce").fillna(0).astype(int)
+
+
+        ba_sheet_name = f"Bottleneck_Analysis{sheet_sfx}"
+        ba.to_excel(writer, sheet_name=ba_sheet_name, index=False)
+        ws_ba = writer.sheets[ba_sheet_name]
+
+        _xl_format_columns(ws_ba, {
+            "FG Units Possible Value": EGP_FMT,
+            "FG Units Possible_sit Value": EGP_FMT,
+            "Surplus/Shortage vs Target": INT_FMT,
+        })
+
+        # NEW ➜ Format & highlight negatives for RM Surplus after Production
+        for c in surplus_cols:
+            _xl_format_columns(ws_ba, {c: INT_FMT})
+            _xl_highlight_negative(ws_ba, c)
+
+        # If the target gap column exists here, also highlight negatives
+        _xl_highlight_negative(ws_ba, "Surplus/Shortage vs Target")
+
+        # ---- 3) Family Summary
+        fam_sheet_name = f"Family_Summary{sheet_sfx}"
+        family_summary.to_excel(writer, sheet_name=fam_sheet_name, index=False)
 
     return output_buffer.getvalue()
+
 
 
 
@@ -914,6 +1063,7 @@ def create_enhanced_visualizations(data_original, data_sit, title_suffix="", uni
                 st.warning("No data available for Financial Analysis.")
 
 
+
 # ==============================================================================
 # MAIN PROCESSING LOGIC WITH SESSION STATE MANAGEMENT
 # ==============================================================================
@@ -940,6 +1090,38 @@ if process_data:
                 bom_data = load_and_clean_bom(demand_planning_file)
                 if bom_data is None:
                     st.stop()
+
+                # ✅ Apply Market filter to BOM
+                if bom_data is not None and "Market" in bom_data.columns:
+                    selected_any = chk_market_imported or chk_market_local or chk_market_inhouse
+                    selected_all = chk_market_imported and chk_market_local and chk_market_inhouse
+
+                    # Normalize BOM market text once
+                    bom_market_norm = bom_data["Market"].astype(str).str.strip().str.lower()
+
+                    # Build selected set (handle In House spelling variants)
+                    selected_norm = set()
+                    if chk_market_imported:
+                        selected_norm.add("imported")
+                    if chk_market_local:
+                        selected_norm.add("local")
+                    if chk_market_inhouse:
+                        selected_norm.update(["in house", "inhouse", "in-house"])
+
+                    if selected_any and not selected_all:
+                        keep_mask = bom_market_norm.isin(selected_norm)
+                        before_rows = bom_data.shape[0]
+                        bom_data = bom_data.loc[keep_mask].copy()
+                        after_rows = bom_data.shape[0]
+                        picked_labels = ", ".join(
+                            [lbl for lbl, on in [("Imported", chk_market_imported),
+                                                ("Local", chk_market_local),
+                                                ("In House", chk_market_inhouse)] if on]
+                        )
+                        st.info(f"Applied Market filter: **{picked_labels}** · Rows: {after_rows}/{before_rows}")
+                    elif not selected_any:
+                        st.warning("All Market options are unchecked — keeping all markets (no filter applied).")
+
 
                 # Step 2: Process SIT files if uploaded
                 status_text.text("🔄 Processing SIT files...")
