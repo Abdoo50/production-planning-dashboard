@@ -575,7 +575,7 @@ def process_all_sit_sources_streamlit(sit_files, filter_month, filter_year):
 @handle_errors
 def load_target_plan(file_obj):
     """
-    Load target plan from demand planning file, specifically from 'Forecast July 25' column.
+    Load target plan from demand planning file, specifically from 'Target' column.
     """
     try:
         # Try different sheet names for target data
@@ -586,14 +586,14 @@ def load_target_plan(file_obj):
             try:
                 target_df = pd.read_excel(file_obj, sheet_name=sheet_name)
 
-                # Look for 'F.G. CMMF' or 'CMMF' and 'Forecast July 25'
+                # Look for 'F.G. CMMF' or 'CMMF' and 'Target'
                 fg_col = None
                 if "F.G. CMMF" in target_df.columns: fg_col = "F.G. CMMF"
                 elif "CMMF" in target_df.columns: fg_col = "CMMF"
 
-                if fg_col and "Forecast July 25" in target_df.columns:
-                    target_plan = target_df.set_index(fg_col)["Forecast July 25"].to_dict()
-                    st.success(f"Loaded target plan from sheet '{sheet_name}' using 'Forecast July 25' with {len(target_plan)} targets")
+                if fg_col and "Target" in target_df.columns:
+                    target_plan = target_df.set_index(fg_col)["Target"].to_dict()
+                    st.success(f"Loaded target plan from sheet '{sheet_name}' using 'Target' with {len(target_plan)} targets")
 
                     # Canonicalize keys to match BOM FG codes
                     target_plan = {_canon_code_str(k): int(v) for k, v in target_plan.items() if pd.notna(v)}
@@ -603,7 +603,7 @@ def load_target_plan(file_obj):
                 continue
         
         # If no target plan found, create a default one
-        st.warning("No target plan found in demand planning file using 'Forecast July 25'. Using default targets.")
+        st.warning("No target plan found in demand planning file using 'Target'. Using default targets.")
         return {}
         
     except Exception as e:
