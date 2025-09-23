@@ -135,18 +135,55 @@ analysis_type = st.sidebar.radio(
     ["With Target", "Without Target", "Both"]
 )
 
-# Date filtering for SIT
-st.sidebar.header("📅 Date Filtering")
-filter_month = st.sidebar.selectbox(
-    "Filter SIT data by month:",
-    ["All", "July", "August", "September", "October", "November", "December"],
-    help="Select 'All' to include all months without filtering"
+# NEW: Allocation method selection
+st.sidebar.header("🔧 Allocation Method")
+allocation_method = st.sidebar.radio(
+    "Select Allocation Method:",
+    [
+        "Equally Distribution",
+        "Production Plan Based (Target)",
+        "Price Priority Distribution",
+    ],
+    help=(
+        "Choose how to allocate stock among FGs that share the same RM."
+        "\n- Equally Distribution: Split stock evenly among FGs."
+        "\n- Production Plan Based (Target): Allocate by target requirements (Target × Qty/Unit)."
+        "\n- Price Priority Distribution: Allocate by priority of price (selling price or RM value)."
+    ),
 )
 
-filter_year = st.sidebar.selectbox(
-    "Filter SIT data by year:",
+# Date range filtering for SIT (start and end).
+st.sidebar.header("📅 Date Range Filter (SIT)")
+
+# Allow the user to select a starting month and year and an ending month and year. When both
+# ranges are set to specific values (not "All"), the SIT data will be filtered to include
+# only records whose date lies within the inclusive range. If any of the start or end
+# selections are "All", no date filtering is applied (consistent with the previous behaviour
+# that allowed viewing all months/years). Removing the prior single-month filter ensures that
+# filtering is controlled exclusively via this range selector.
+
+range_start_month = st.sidebar.selectbox(
+    "Range start month:",
+    ["All", "July", "August", "September", "October", "November", "December"],
+    help="Select the first month in the range or 'All' to include all months"
+)
+
+range_start_year = st.sidebar.selectbox(
+    "Range start year:",
     ["All", 2025, 2024, 2026],
-    help="Select 'All' to include all years without filtering"
+    help="Select the first year in the range or 'All' to include all years"
+)
+
+range_end_month = st.sidebar.selectbox(
+    "Range end month:",
+    ["All", "July", "August", "September", "October", "November", "December"],
+    help="Select the last month in the range or 'All' to include all months"
+)
+
+range_end_year = st.sidebar.selectbox(
+    "Range end year:",
+    ["All", 2025, 2024, 2026],
+    help="Select the last year in the range or 'All' to include all years"
 )
 
 # --- Market filter (BOM) ---
@@ -262,7 +299,17 @@ def load_and_clean_bom(file_obj):
     bom_data.dropna(subset=['Family', 'RM CMMF', 'F.G. CMMF', 'RM In Stock', 'Qty / Unit'], inplace=True)
     for col in ['RM In Stock', 'Qty / Unit', 'RM Value']:
         bom_data[col] = pd.to_numeric(bom_data[col], errors='coerce').fillna(0)
-    
+
+    # If a Target column exists, convert to numeric and drop rows where Target is missing or <= 0.
+    if 'Target' in bom_data.columns:
+        bom_data['Target'] = pd.to_numeric(bom_data['Target'], errors='coerce').fillna(0)
+        # Filter out rows with zero or negative Target
+        before_rows = bom_data.shape[0]
+        bom_data = bom_data[bom_data['Target'] > 0].copy()
+        after_rows = bom_data.shape[0]
+        if before_rows != after_rows:
+            st.info(f"Dropped {before_rows - after_rows} BOM rows with missing or zero Target values.")
+
     st.success(f"BOM data cleaned. Working with all {bom_data.shape[0]} rows.")
 
     # Ensure codes are canonical strings for consistent joins and isin()
@@ -270,6 +317,218 @@ def load_and_clean_bom(file_obj):
     bom_data["F.G. CMMF"] = _canon_series(bom_data["F.G. CMMF"])
 
     return bom_data
+
+# ==============================================================================
+# ALLOCATION FUNCTIONS
+# These functions perform stock allocation among FGs that share the same RM.
+# allocate_equal: distributes stock equally among FGs using the same RM.
+# allocate_by_target: distributes stock proportionally to each FG's target requirement (Target × Qty/Unit) with
+# a baseline value for FGs whose target is zero, ensuring no FG is starved of stock.
+# ==============================================================================
+
+@handle_errors
+def allocate_equal(data: pd.DataFrame, total_stock_col: str, suffix: str = "") -> pd.DataFrame:
+    """Allocate stock equally among FGs that share the same RM.
+
+    This function calculates the number of FGs sharing each RM and divides the available stock
+    equally among them. FGs that are the sole consumer of an RM receive the full amount.
+
+    Args:
+        data: DataFrame containing BOM or SIT-enhanced data.
+        total_stock_col: Name of the column containing total stock for each RM.
+        suffix: Optional suffix for the allocated stock column name (e.g., '_sit' or '_sim').
+
+    Returns:
+        DataFrame with an added 'Allocated Stock{suffix}' column containing the allocated stock per FG.
+    """
+    if data is None or data.empty:
+        return data
+    df = data.copy()
+    allocated_stock_col = f"Allocated Stock{suffix}"
+    # Count how many FGs use each RM
+    rm_fg_counts = df.groupby('RM CMMF')['F.G. CMMF'].transform('nunique')
+    # Initialize allocation with total stock
+    df[allocated_stock_col] = df[total_stock_col]
+    # For each RM group, distribute equally among FGs that can produce at least one unit
+    for rm, group in df.groupby('RM CMMF'):
+        indices = group.index
+        n = len(group)
+        total_stock = group[total_stock_col].iloc[0]
+        # average stock per FG if divided equally
+        avg_stock = total_stock / n if n > 0 else 0
+        # quantity required per FG unit
+        qtys = group['Qty / Unit'].astype(float).values
+        # determine which FGs can produce at least one unit from equal share
+        producible_mask = qtys <= avg_stock
+        # assign equal weight only to producible FGs
+        weights = np.where(producible_mask, 1.0, 0.0)
+        weight_sum = weights.sum()
+        if weight_sum > 0:
+            # normalised weights for FGs that can produce
+            weights_norm = weights / weight_sum
+            df.loc[indices, allocated_stock_col] = weights_norm * total_stock
+        else:
+            # if no FG can produce, fall back to equal share
+            df.loc[indices, allocated_stock_col] = total_stock / n if n > 0 else 0
+    return df
+
+
+@handle_errors
+def allocate_by_target(
+    data: pd.DataFrame,
+    total_stock_col: str,
+    target_plan: dict,
+    suffix: str = ""
+) -> pd.DataFrame:
+    """Allocate stock among FGs based on their target requirements.
+
+    Stock is allocated proportionally to each FG's target requirement (Target × Qty/Unit). When no
+    positive target is defined within a group, the allocation falls back to equal distribution. FGs
+    with zero target receive no allocation when positive targets exist in their RM group. If all targets
+    in a group are zero or missing, the allocation falls back to equal distribution among FGs.
+
+    Args:
+        data: DataFrame containing BOM or SIT-enhanced data.
+        total_stock_col: Name of the column containing total stock for each RM.
+        target_plan: Dictionary mapping FG codes to target quantities. If empty, the 'Target'
+            column in `data` is used (defaulting to 0 when missing).
+        suffix: Optional suffix for the allocated stock column name.
+
+    Returns:
+        DataFrame with an added 'Allocated Stock{suffix}' column and 'Target Weight' column
+        containing the allocation weight per FG.
+    """
+    if data is None or data.empty:
+        return data
+    df = data.copy()
+    allocated_stock_col = f"Allocated Stock{suffix}"
+    # Determine source of target values: use target_plan if provided, otherwise use 'Target' column
+    if target_plan:
+        df['target_value'] = (
+            df['F.G. CMMF']
+            .astype(str)
+            .str.replace(r"\.0+$", "", regex=True)
+            .str.strip()
+            .map(target_plan)
+            .fillna(0)
+        )
+    else:
+        # Use the 'Target' column directly (fill missing with 0)
+        df['target_value'] = pd.to_numeric(df.get('Target', 0), errors='coerce').fillna(0)
+
+    # Initialize allocated stock with total stock (default)
+    df[allocated_stock_col] = df[total_stock_col]
+    # Process each RM group independently
+    for rm, group in df.groupby('RM CMMF'):
+        indices = group.index
+        n = len(group)
+        total_stock = group[total_stock_col].iloc[0]
+        targets = group['target_value'].astype(float).values
+        qtys = group['Qty / Unit'].astype(float).values
+        if n > 1:
+            # Compute average stock per FG if divided equally
+            avg_stock = total_stock / n if n > 0 else 0
+            # Determine FGs that can produce at least one unit and have positive target
+            producible_mask = (qtys <= avg_stock) & (targets > 0)
+            if producible_mask.any():
+                eff_targets = np.where(producible_mask, targets, 0)
+                # Compute required RM for each FG: eff_target × qty per unit
+                reqs = eff_targets * qtys
+                total_req = reqs.sum()
+                if total_req > 0:
+                    weights = reqs / total_req
+                else:
+                    weights = np.zeros(n)
+            else:
+                # If no FGs meet criteria, fall back to equal distribution among producible FGs (qtys <= avg_stock)
+                alt_mask = qtys <= avg_stock
+                if alt_mask.any():
+                    weights = np.where(alt_mask, 1.0 / alt_mask.sum(), 0.0)
+                else:
+                    # If no FGs can produce at all, distribute equally among all
+                    weights = np.ones(n) / n
+            # Assign allocated stock and target weight
+            df.loc[indices, allocated_stock_col] = weights * total_stock
+            df.loc[indices, 'Target Weight'] = weights
+        else:
+            # Single FG consumes all available stock
+            df.loc[indices, allocated_stock_col] = total_stock
+            df.loc[indices, 'Target Weight'] = 1.0
+    # Drop temporary target_value column
+    df = df.drop(columns=['target_value'], errors='ignore')
+    return df
+
+
+@handle_errors
+def allocate_by_price(
+    data: pd.DataFrame,
+    total_stock_col: str,
+    suffix: str = ""
+) -> pd.DataFrame:
+    """Allocate stock among FGs based on price priority.
+
+    Stock is allocated proportionally to each FG's price value.  If a `Price` column exists
+    in the BOM, it is used directly.  Otherwise, the raw-material value per FG is used
+    (\ `RM Value × Qty / Unit\`).  When all price values in a group are zero or missing,
+    allocation falls back to equal distribution.
+
+    Args:
+        data: DataFrame containing BOM or SIT-enhanced data.
+        total_stock_col: Name of the column containing total stock for each RM.
+        suffix: Optional suffix for the allocated stock column name (e.g., '_sit' or '_sim').
+
+    Returns:
+        DataFrame with an added 'Allocated Stock{suffix}' column and 'Price Weight' column
+        containing the allocation weight per FG.
+    """
+    if data is None or data.empty:
+        return data
+    df = data.copy()
+    allocated_stock_col = f"Allocated Stock{suffix}"
+    # Determine price value per FG: prefer 'Price' column (selling price). If missing, use RM Value × Qty/Unit.
+    if 'Price' in df.columns:
+        df['price_value'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
+    else:
+        # Use RM Value × Qty / Unit as proxy for price priority
+        df['price_value'] = pd.to_numeric(df.get('RM Value', 0), errors='coerce').fillna(0) * df['Qty / Unit']
+
+    # Initialize allocated stock with total stock
+    df[allocated_stock_col] = df[total_stock_col]
+    # Process each RM group independently
+    for rm, group in df.groupby('RM CMMF'):
+        indices = group.index
+        n = len(group)
+        total_stock = group[total_stock_col].iloc[0]
+        prices = group['price_value'].astype(float).values
+        qtys = group['Qty / Unit'].astype(float).values
+        if n > 1:
+            # average stock per FG
+            avg_stock = total_stock / n if n > 0 else 0
+            # Only consider FGs that can produce at least one unit and have positive price
+            producible_mask = (qtys <= avg_stock) & (prices > 0)
+            if producible_mask.any():
+                price_masked = np.where(producible_mask, prices, 0)
+                total_price = price_masked.sum()
+                if total_price > 0:
+                    weights = price_masked / total_price
+                else:
+                    weights = np.zeros(n)
+            else:
+                # If no FGs meet criteria, fall back to equal distribution among producible FGs (qtys <= avg_stock)
+                alt_mask = qtys <= avg_stock
+                if alt_mask.any():
+                    weights = np.where(alt_mask, 1.0 / alt_mask.sum(), 0.0)
+                else:
+                    # If no FGs can produce, equal distribution among all
+                    weights = np.ones(n) / n
+            df.loc[indices, allocated_stock_col] = weights * total_stock
+            df.loc[indices, 'Price Weight'] = weights
+        else:
+            df.loc[indices, allocated_stock_col] = total_stock
+            df.loc[indices, 'Price Weight'] = 1.0
+    # Clean up temporary column
+    df = df.drop(columns=['price_value'], errors='ignore')
+    return df
 
 @handle_errors
 def allocate_common_rms(data, total_stock_col, suffix=''):
@@ -316,10 +575,15 @@ def run_bottleneck_analysis_without_target(data, total_stock_col, allocated_stoc
     analysis_data[potential_units_col] = analysis_data.groupby('F.G. CMMF')[fg_units_possible_col].transform(get_hypothetical_min)
 
     # --- Step 2: Create family summary ---
-    family_summary = analysis_data.groupby('Family', as_index=False).agg(
-        Total_Producible_Units=(max_fg_units_col, lambda x: x.drop_duplicates().sum())
+    # Correct logic: sum once per unique FG, then aggregate by Family.
+    family_summary = (
+        analysis_data[["Family", "F.G. CMMF", max_fg_units_col]]
+        .groupby(["Family", "F.G. CMMF"], as_index=False)[max_fg_units_col]
+        .first()
+        .groupby("Family", as_index=False)[max_fg_units_col]
+        .sum()
+        .rename(columns={max_fg_units_col: f"Total Producible Units by Family{suffix}"})
     )
-    family_summary.rename(columns={'Total_Producible_Units': f'Total Producible Units by Family{suffix}'}, inplace=True)
     
     # --- Step 3: CORRECTED LOGIC FOR REQUIREMENT & SURPLUS ---
     
@@ -388,8 +652,15 @@ def run_bottleneck_analysis_with_target(data, total_stock_col, allocated_stock_c
     analysis_data[potential_units_col] = analysis_data.groupby('F.G. CMMF')[fg_units_possible_col].transform(get_hypothetical_min)
 
     # --- Step 2: Create family summary (based on original potential) ---
-    family_summary = analysis_data.groupby('Family', as_index=False).agg(Total_Producible_Units=(max_fg_units_col, lambda x: x.drop_duplicates().sum()))
-    family_summary.rename(columns={'Total_Producible_Units': f'Total Producible Units by Family{suffix}'}, inplace=True)
+    # Correct logic: sum once per unique FG, then aggregate by Family.
+    family_summary = (
+        analysis_data[["Family", "F.G. CMMF", max_fg_units_col]]
+        .groupby(["Family", "F.G. CMMF"], as_index=False)[max_fg_units_col]
+        .first()
+        .groupby("Family", as_index=False)[max_fg_units_col]
+        .sum()
+        .rename(columns={max_fg_units_col: f"Total Producible Units by Family{suffix}"})
+    )
     
     # --- Step 3: Calculate original requirement and surplus ---
     analysis_data[required_rm_col] = analysis_data[max_fg_units_col] * analysis_data['Qty / Unit']
@@ -523,29 +794,146 @@ def create_fg_summary_view(bottleneck_df, allocated_stock_col, suffix=''):
     return fg_view[final_order]
 
 @handle_errors
-def process_all_sit_sources_streamlit(sit_files, filter_month, filter_year):
+def process_all_sit_sources_streamlit(
+    sit_files,
+    range_start_month,
+    range_start_year,
+    range_end_month,
+    range_end_year,
+):
     """
-    Processes SIT data sources using the Streamlit uploaded files and filters by date.
+    Processes SIT data sources uploaded via Streamlit and applies optional date filtering
+    across a range of months and years.  If both the start and end selections are
+    specific values (not "All"), then only rows whose date (via SITDateClassifier)
+    fall within the inclusive range are retained. Otherwise, no date filtering is
+    applied.
+
+    Parameters
+    ----------
+    sit_files : list
+        List of uploaded SIT file-like objects.
+    range_start_month : str
+        The starting month name (e.g., "July").  "All" means no lower bound.
+    range_start_year : int or str
+        The starting year (e.g., 2025).  "All" means no lower bound.
+    range_end_month : str
+        The ending month name.  "All" means no upper bound.
+    range_end_year : int or str
+        The ending year.  "All" means no upper bound.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        A DataFrame with columns ["RM CMMF", "SIT Quantity"] summarised across all
+        loaded SIT files, or None if no valid data.
     """
     all_sit_data = []
 
+    # Precompute month order map for months included in the UI
+    month_order = {
+        "July": 7,
+        "August": 8,
+        "September": 9,
+        "October": 10,
+        "November": 11,
+        "December": 12,
+    }
+
+    # Determine if date filtering should be applied.  Only apply if both start and end are
+    # specified (not "All"). Otherwise treat as no filter (all months/years).
+    apply_range_filter = (
+        range_start_month != "All"
+        and range_start_year != "All"
+        and range_end_month != "All"
+        and range_end_year != "All"
+    )
+
+    # If applying range filter, compute all (month, year) pairs between start and end (inclusive)
+    date_pairs = []
+    if apply_range_filter:
+        try:
+            start_year_int = int(range_start_year)
+            end_year_int = int(range_end_year)
+            start_month_num = month_order.get(str(range_start_month), None)
+            end_month_num = month_order.get(str(range_end_month), None)
+            if start_month_num is None or end_month_num is None:
+                apply_range_filter = False
+            else:
+                # Build list of (year, month) tuples within range
+                from datetime import date
+                start_date = date(start_year_int, start_month_num, 1)
+                end_date = date(end_year_int, end_month_num, 1)
+                # If start is after end, swap to ensure non-empty range
+                if start_date > end_date:
+                    start_date, end_date = end_date, start_date
+                # Generate all months between start_date and end_date inclusive
+                current_year = start_date.year
+                current_month = start_date.month
+                while (current_year < end_date.year) or (
+                    current_year == end_date.year and current_month <= end_date.month
+                ):
+                    # Append month name and year for each iteration
+                    # Map numeric month back to name using month_order reverse mapping
+                    month_name = [k for k, v in month_order.items() if v == current_month]
+                    if month_name:
+                        date_pairs.append((month_name[0], current_year))
+                    # Increment month/year
+                    if current_month == 12:
+                        current_month = 7  # start of UI range (July) after December
+                        current_year += 1
+                    else:
+                        current_month += 1
+                        # Skip months not in month_order (January–June) by advancing to July
+                        if current_month < 7:
+                            current_month = 7
+                # End while
+        except Exception:
+            apply_range_filter = False
+
     # Process the uploaded SIT files
     multi_file_frames = []
-    required_cols_multi = ['PO number ', 'Item No.', 'Quantity', 'Updated ETA port', 'ETA  port']
-    
+    # Define the key columns we need from each SIT file.  We include both
+    # 'Quantity' and 'Remaining Open Quantity' so that we can later choose
+    # whichever quantity field is present for each file.  Additional date
+    # columns are included for date filtering, but we will not drop duplicates
+    # based on them.
+    required_cols_multi = [
+        'PO number ',
+        'Item No.',
+        'Quantity',
+        'Remaining Open Quantity',
+        'Updated ETA port',
+        'ETA  port',
+    ]
+
     for i, sit_file_obj in enumerate(sit_files):
         try:
             # Read the file object directly
             sit_df = pd.read_excel(sit_file_obj)
-            
-            # Apply date filtering if not "All"
-            if filter_month != "All" or filter_year != "All":
-                sit_df = sit_classifier.filter_by_month(sit_df, filter_month, filter_year)
-            
+
+            # If using range filter, build a cumulative DataFrame for all month-year pairs
+            if apply_range_filter and date_pairs:
+                filtered_frames = []
+                for (month_name, year_val) in date_pairs:
+                    try:
+                        # Use sit_classifier.filter_by_month on a copy of the DataFrame
+                        temp_df = sit_classifier.filter_by_month(
+                            sit_df.copy(), month_name, year_val
+                        )
+                        filtered_frames.append(temp_df)
+                    except Exception:
+                        continue
+                if filtered_frames:
+                    sit_df = pd.concat(filtered_frames, ignore_index=True)
+                else:
+                    sit_df = pd.DataFrame(columns=sit_df.columns)
+            # Else, if no range filter, do not filter by date (include all rows)
+
+            # Restrict to required columns, adding missing columns filled with NaN
             available_cols = [col for col in required_cols_multi if col in sit_df.columns]
             sit_df = sit_df[available_cols]
             for col in required_cols_multi:
-                if col not in sit_df.columns: 
+                if col not in sit_df.columns:
                     sit_df[col] = np.nan
             multi_file_frames.append(sit_df[required_cols_multi])
         except Exception as e:
@@ -553,12 +941,21 @@ def process_all_sit_sources_streamlit(sit_files, filter_month, filter_year):
 
     if multi_file_frames:
         merged_multi = pd.concat(multi_file_frames, ignore_index=True)
-        merged_multi.drop_duplicates(inplace=True)  # Critical duplicate check on full data
-        df_for_grouping = merged_multi[['Item No.', 'Quantity']].copy()
-        df_for_grouping['Quantity'] = pd.to_numeric(df_for_grouping['Quantity'], errors='coerce').fillna(0)
-        grouped_multi = df_for_grouping.groupby('Item No.', as_index=False)['Quantity'].sum()
-        grouped_multi.rename(columns={'Item No.': 'RM CMMF', 'Quantity': 'SIT Quantity'}, inplace=True)
-        all_sit_data.append(grouped_multi)
+        # Determine which quantity column to use: prefer 'Remaining Open Quantity' if present,
+        # otherwise fall back to 'Quantity'.  Convert to numeric for summation.
+        qty_col = None
+        if 'Remaining Open Quantity' in merged_multi.columns:
+            qty_col = 'Remaining Open Quantity'
+        elif 'Quantity' in merged_multi.columns:
+            qty_col = 'Quantity'
+        if qty_col is not None:
+            merged_multi[qty_col] = pd.to_numeric(merged_multi[qty_col], errors='coerce').fillna(0)
+            grouped_multi = merged_multi.groupby('Item No.', as_index=False)[qty_col].sum()
+            grouped_multi.rename(
+                columns={'Item No.': 'RM CMMF', qty_col: 'SIT Quantity'},
+                inplace=True,
+            )
+            all_sit_data.append(grouped_multi)
 
     # Merge and Finalize
     if not all_sit_data:
@@ -566,10 +963,10 @@ def process_all_sit_sources_streamlit(sit_files, filter_month, filter_year):
 
     # Combine the results from all sources
     final_sit_data = pd.concat(all_sit_data, ignore_index=True)
-    
+
     # Perform the final groupby and sum
     final_grouped_data = final_sit_data.groupby('RM CMMF', as_index=False)['SIT Quantity'].sum()
-    
+
     final_grouped_data["RM CMMF"] = _canon_series(final_grouped_data["RM CMMF"])
     return final_grouped_data
 
@@ -1127,24 +1524,39 @@ if process_data:
                 # Step 2: Process SIT files if uploaded
                 status_text.text("🔄 Processing SIT files...")
                 progress_bar.progress(20)
-                
+
                 sit_summary = pd.DataFrame()
-                
+
                 if sit_files:
+                    # Apply date range filter using the selected start/end month/year values.  If any
+                    # of the range selectors are "All", the SIT data will not be filtered by
+                    # date (include all rows).  The date filtering itself is handled in
+                    # process_all_sit_sources_streamlit.
                     sit_summary = process_all_sit_sources_streamlit(
-                        sit_files, filter_month, filter_year
+                        sit_files,
+                        range_start_month,
+                        range_start_year,
+                        range_end_month,
+                        range_end_year,
                     )
-                    
+
                     if sit_summary is not None and not sit_summary.empty:
-                        filter_description = f"{filter_month} {filter_year}"
-                        if filter_month == "All" and filter_year == "All":
+                        # Build a human-readable description of the applied date range.  If all
+                        # selectors are "All" then report that no filtering was applied.  Otherwise
+                        # report the inclusive range.
+                        if (
+                            range_start_month != "All"
+                            and range_start_year != "All"
+                            and range_end_month != "All"
+                            and range_end_year != "All"
+                        ):
+                            filter_description = f"{range_start_month} {range_start_year} – {range_end_month} {range_end_year}"
+                        else:
                             filter_description = "All months and years (no filtering)"
-                        elif filter_month == "All":
-                            filter_description = f"All months in {filter_year}"
-                        elif filter_year == "All":
-                            filter_description = f"{filter_month} (all years)"
-                        
-                        st.success(f"Successfully processed SIT data for {filter_description}: {len(sit_summary)} unique items")
+
+                        st.success(
+                            f"Successfully processed SIT data for {filter_description}: {len(sit_summary)} unique items"
+                        )
                     else:
                         st.info("No valid SIT data processed. Continuing with original stock only.")
 
@@ -1197,8 +1609,21 @@ if process_data:
                     status_text.text("🔄 Running analysis without target...")
                     progress_bar.progress(50)
                     
-                    # Process ORIGINAL data (without SIT)
-                    original_without_target = allocate_common_rms(original_data.copy(), "Total Stock", "")
+                    # Choose allocation function based on user-selected method for 'Without Target' analysis
+                    # If 'Equally Distribution' is selected, allocate stock equally among FGs sharing an RM.
+                    # Otherwise, allocate based on target plan (or Target column) using target requirements.
+                    if allocation_method == "Equally Distribution":
+                        original_without_target = allocate_equal(
+                            original_data.copy(), "Total Stock", ""
+                        )
+                    elif allocation_method == "Production Plan Based (Target)":
+                        original_without_target = allocate_by_target(
+                            original_data.copy(), "Total Stock", target_plan, ""
+                        )
+                    else:  # Price Priority Distribution
+                        original_without_target = allocate_by_price(
+                            original_data.copy(), "Total Stock", ""
+                        )
                     family_summary_orig, bottleneck_analysis_orig, _ = run_bottleneck_analysis_without_target(
                         original_without_target, "Total Stock", "Allocated Stock", ""
                     )
@@ -1206,41 +1631,147 @@ if process_data:
                     
                     # Process SIT-ENHANCED data
                     sit_suffix = "_sit" if sit_summary is not None and not sit_summary.empty else ""
-                    sit_without_target = allocate_common_rms(sit_enhanced_data.copy(), "Total Stock", sit_suffix)
+                    if allocation_method == "Equally Distribution":
+                        sit_without_target = allocate_equal(
+                            sit_enhanced_data.copy(), "Total Stock", sit_suffix
+                        )
+                    elif allocation_method == "Production Plan Based (Target)":
+                        sit_without_target = allocate_by_target(
+                            sit_enhanced_data.copy(), "Total Stock", target_plan, sit_suffix
+                        )
+                    else:
+                        sit_without_target = allocate_by_price(
+                            sit_enhanced_data.copy(), "Total Stock", sit_suffix
+                        )
                     family_summary_sit, bottleneck_analysis_sit, _ = run_bottleneck_analysis_without_target(
                         sit_without_target, "Total Stock", f"Allocated Stock{sit_suffix}", sit_suffix
                     )
                     fg_summary_sit = create_fg_summary_view(bottleneck_analysis_sit, f"Allocated Stock{sit_suffix}", sit_suffix)
                     
-                    # Store results
+                    # Compute additional KPI metrics (surplus and shortage value) for without-target analysis
+                    def _calc_surplus_shortage_metrics(bn_df):
+                        try:
+                            # Surplus/shortage values are computed from RM Surplus after Production and RM Value
+                            col_name = f"RM Surplus after Production{sit_suffix}" if sit_suffix else "RM Surplus after Production"
+                            if col_name not in bn_df.columns:
+                                # Fall back to base column
+                                col_name = "RM Surplus after Production"
+                            surplus_series = pd.to_numeric(bn_df[col_name], errors='coerce').fillna(0)
+                            value_series = pd.to_numeric(bn_df.get('RM Value', 0), errors='coerce').fillna(0)
+                            total_surplus_val = (surplus_series[surplus_series > 0] * value_series[surplus_series > 0]).sum()
+                            total_shortage_val = (surplus_series[surplus_series < 0].abs() * value_series[surplus_series < 0]).sum()
+                            return {
+                                'Total Surplus Value': total_surplus_val,
+                                'Total Shortage Value': total_shortage_val,
+                            }
+                        except Exception:
+                            return {
+                                'Total Surplus Value': 0,
+                                'Total Shortage Value': 0,
+                            }
+
+                    orig_metrics = _calc_surplus_shortage_metrics(bottleneck_analysis_orig)
+                    sit_metrics = _calc_surplus_shortage_metrics(bottleneck_analysis_sit)
+
+                    # Store results including KPI metrics
                     results['without_target'] = {
-                        'original': {'fg': fg_summary_orig, 'bottleneck': bottleneck_analysis_orig, 'family': family_summary_orig},
-                        'sit': {'fg': fg_summary_sit, 'bottleneck': bottleneck_analysis_sit, 'family': family_summary_sit}
+                        'original': {
+                            'fg': fg_summary_orig,
+                            'bottleneck': bottleneck_analysis_orig,
+                            'family': family_summary_orig,
+                            'metrics': orig_metrics,
+                        },
+                        'sit': {
+                            'fg': fg_summary_sit,
+                            'bottleneck': bottleneck_analysis_sit,
+                            'family': family_summary_sit,
+                            'metrics': sit_metrics,
+                        }
                     }
 
                 if analysis_type in ["With Target", "Both"]:
                     status_text.text("🔄 Running analysis with target...")
                     progress_bar.progress(70)
                     
-                    # Process ORIGINAL data (without SIT)
-                    original_with_target = allocate_common_rms(original_data.copy(), "Total Stock", "")
+                    # For analyses that use production targets, choose allocation function based on user selection.
+                    # Equally Distribution: allocate stock equally; Production Plan Based: allocate by target; Price Priority: allocate by price.
+                    if allocation_method == "Equally Distribution":
+                        original_with_target = allocate_equal(
+                            original_data.copy(), "Total Stock", ""
+                        )
+                    elif allocation_method == "Production Plan Based (Target)":
+                        original_with_target = allocate_by_target(
+                            original_data.copy(), "Total Stock", target_plan, ""
+                        )
+                    else:
+                        original_with_target = allocate_by_price(
+                            original_data.copy(), "Total Stock", ""
+                        )
                     family_summary_orig_tgt, bottleneck_analysis_orig_tgt, _ = run_bottleneck_analysis_with_target(
                         original_with_target, "Total Stock", "Allocated Stock", target_plan, ""
                     )
                     fg_summary_orig_tgt = create_fg_summary_view(bottleneck_analysis_orig_tgt, "Allocated Stock", "")
                     
-                    # Process SIT-ENHANCED data
+                    # Process SIT-enhanced data using selected allocation function
                     sit_suffix = "_sit" if sit_summary is not None and not sit_summary.empty else ""
-                    sit_with_target = allocate_common_rms(sit_enhanced_data.copy(), "Total Stock", sit_suffix)
+                    if allocation_method == "Equally Distribution":
+                        sit_with_target = allocate_equal(
+                            sit_enhanced_data.copy(), "Total Stock", sit_suffix
+                        )
+                    elif allocation_method == "Production Plan Based (Target)":
+                        sit_with_target = allocate_by_target(
+                            sit_enhanced_data.copy(), "Total Stock", target_plan, sit_suffix
+                        )
+                    else:
+                        sit_with_target = allocate_by_price(
+                            sit_enhanced_data.copy(), "Total Stock", sit_suffix
+                        )
                     family_summary_sit_tgt, bottleneck_analysis_sit_tgt, _ = run_bottleneck_analysis_with_target(
                         sit_with_target, "Total Stock", f"Allocated Stock{sit_suffix}", target_plan, sit_suffix
                     )
                     fg_summary_sit_tgt = create_fg_summary_view(bottleneck_analysis_sit_tgt, f"Allocated Stock{sit_suffix}", sit_suffix)
                     
-                    # Store results
+                    # Compute KPI metrics for with-target analysis (using Surplus/Shortage vs Target)
+                    def _calc_target_metrics(bn_df):
+                        try:
+                            # Surplus/shortage vs Target multiplied by RM Value
+                            col_name = "Surplus/Shortage vs Target"
+                            if col_name not in bn_df.columns:
+                                return {
+                                    'Total Surplus vs Target Value': 0,
+                                    'Total Shortage vs Target Value': 0,
+                                }
+                            surplus_series = pd.to_numeric(bn_df[col_name], errors='coerce').fillna(0)
+                            value_series = pd.to_numeric(bn_df.get('RM Value', 0), errors='coerce').fillna(0)
+                            total_surplus_val = (surplus_series[surplus_series > 0] * value_series[surplus_series > 0]).sum()
+                            total_shortage_val = (surplus_series[surplus_series < 0].abs() * value_series[surplus_series < 0]).sum()
+                            return {
+                                'Total Surplus vs Target Value': total_surplus_val,
+                                'Total Shortage vs Target Value': total_shortage_val,
+                            }
+                        except Exception:
+                            return {
+                                'Total Surplus vs Target Value': 0,
+                                'Total Shortage vs Target Value': 0,
+                            }
+
+                    orig_target_metrics = _calc_target_metrics(bottleneck_analysis_orig_tgt)
+                    sit_target_metrics = _calc_target_metrics(bottleneck_analysis_sit_tgt)
+
+                    # Store results including KPI metrics
                     results['with_target'] = {
-                        'original': {'fg': fg_summary_orig_tgt, 'bottleneck': bottleneck_analysis_orig_tgt, 'family': family_summary_orig_tgt},
-                        'sit': {'fg': fg_summary_sit_tgt, 'bottleneck': bottleneck_analysis_sit_tgt, 'family': family_summary_sit_tgt}
+                        'original': {
+                            'fg': fg_summary_orig_tgt,
+                            'bottleneck': bottleneck_analysis_orig_tgt,
+                            'family': family_summary_orig_tgt,
+                            'metrics': orig_target_metrics,
+                        },
+                        'sit': {
+                            'fg': fg_summary_sit_tgt,
+                            'bottleneck': bottleneck_analysis_sit_tgt,
+                            'family': family_summary_sit_tgt,
+                            'metrics': sit_target_metrics,
+                        }
                     }
 
                 # Step 6: Store results in session state
@@ -1259,7 +1790,9 @@ if process_data:
                 progress_container.empty()
                 clear_progress()
                 
-                st.success("✅ Analysis completed successfully!")
+                # Inform the user of the allocation method used
+                allocation_msg = f"✅ Analysis completed successfully using **{allocation_method}** allocation method!"
+                st.success(allocation_msg)
                 
             except Exception as e:
                 progress_container.empty()
@@ -1277,50 +1810,72 @@ if st.session_state.analysis_completed and st.session_state.results:
         # Display results based on analysis type
         if analysis_type in ["Without Target", "Both"] and 'without_target' in st.session_state.results:
             st.header("📊 Analysis Without Target")
-            
+
             # Enhanced visualizations
             create_enhanced_visualizations(
-                st.session_state.results['without_target']['original']['fg'], 
-                st.session_state.results['without_target']['sit']['fg'], 
-                "(Without Target)", 
-                "without_target"
+                st.session_state.results['without_target']['original']['fg'],
+                st.session_state.results['without_target']['sit']['fg'],
+                "(Without Target)",
+                "without_target",
             )
-            
+
+            # Display additional metrics for surplus and shortage
+            st.subheader("📉 Surplus and Shortage Metrics")
+            orig_metrics = st.session_state.results['without_target']['original'].get('metrics', {})
+            sit_metrics = st.session_state.results['without_target']['sit'].get('metrics', {})
+            # Use two columns to display original vs SIT metrics
+            mcol1, mcol2 = st.columns(2)
+            with mcol1:
+                st.metric(
+                    "Surplus Value (Original)",
+                    f"{orig_metrics.get('Total Surplus Value', 0):,.0f}",
+                )
+                st.metric(
+                    "Shortage Value (Original)",
+                    f"{orig_metrics.get('Total Shortage Value', 0):,.0f}",
+                )
+            with mcol2:
+                st.metric(
+                    "Surplus Value (With SIT)",
+                    f"{sit_metrics.get('Total Surplus Value', 0):,.0f}",
+                )
+                st.metric(
+                    "Shortage Value (With SIT)",
+                    f"{sit_metrics.get('Total Shortage Value', 0):,.0f}",
+                )
+
             # Download buttons
             st.subheader("📥 Download Options")
-            
             col1, col2 = st.columns(2)
-            
             with col1:
                 # Original data download
                 excel_data_orig = create_excel_output_without_target(
-                    st.session_state.results['without_target']['original']['fg'], 
-                    st.session_state.results['without_target']['original']['bottleneck'], 
-                    st.session_state.results['without_target']['original']['family'], 
-                    "Original"
+                    st.session_state.results['without_target']['original']['fg'],
+                    st.session_state.results['without_target']['original']['bottleneck'],
+                    st.session_state.results['without_target']['original']['family'],
+                    "Original",
                 )
                 if excel_data_orig:
                     st.download_button(
                         label="📥 Download FG to RMAT (Without Target) - Original Data",
                         data=excel_data_orig,
                         file_name="FGtoRMAT(Imported+Local)Withouttarget_Original.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-            
             with col2:
                 # SIT data download
                 excel_data_sit = create_excel_output_without_target(
-                    st.session_state.results['without_target']['sit']['fg'], 
-                    st.session_state.results['without_target']['sit']['bottleneck'], 
-                    st.session_state.results['without_target']['sit']['family'], 
-                    "With_SIT"
+                    st.session_state.results['without_target']['sit']['fg'],
+                    st.session_state.results['without_target']['sit']['bottleneck'],
+                    st.session_state.results['without_target']['sit']['family'],
+                    "With_SIT",
                 )
                 if excel_data_sit:
                     st.download_button(
                         label="📥 Download FG to RMAT (Without Target) - With SIT Data",
                         data=excel_data_sit,
                         file_name="FGtoRMAT(Imported+Local)Withouttarget_WithSIT.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
         if analysis_type in ["With Target", "Both"] and 'with_target' in st.session_state.results:
@@ -1328,47 +1883,68 @@ if st.session_state.analysis_completed and st.session_state.results:
             
             # Enhanced visualizations
             create_enhanced_visualizations(
-                st.session_state.results['with_target']['original']['fg'], 
-                st.session_state.results['with_target']['sit']['fg'], 
-                "(With Target)", 
-                "with_target"
+                st.session_state.results['with_target']['original']['fg'],
+                st.session_state.results['with_target']['sit']['fg'],
+                "(With Target)",
+                "with_target",
             )
-            
+
+            # Display additional metrics for surplus/shortage vs target
+            st.subheader("📉 Surplus/Shortage vs Target Metrics")
+            orig_tgt_metrics = st.session_state.results['with_target']['original'].get('metrics', {})
+            sit_tgt_metrics = st.session_state.results['with_target']['sit'].get('metrics', {})
+            mtcol1, mtcol2 = st.columns(2)
+            with mtcol1:
+                st.metric(
+                    "Surplus Value vs Target (Original)",
+                    f"{orig_tgt_metrics.get('Total Surplus vs Target Value', 0):,.0f}",
+                )
+                st.metric(
+                    "Shortage Value vs Target (Original)",
+                    f"{orig_tgt_metrics.get('Total Shortage vs Target Value', 0):,.0f}",
+                )
+            with mtcol2:
+                st.metric(
+                    "Surplus Value vs Target (With SIT)",
+                    f"{sit_tgt_metrics.get('Total Surplus vs Target Value', 0):,.0f}",
+                )
+                st.metric(
+                    "Shortage Value vs Target (With SIT)",
+                    f"{sit_tgt_metrics.get('Total Shortage vs Target Value', 0):,.0f}",
+                )
+
             # Download buttons
             st.subheader("📥 Download Options")
-            
             col1, col2 = st.columns(2)
-            
             with col1:
                 # Original data download
                 excel_data_orig_tgt = create_excel_output_with_target(
-                    st.session_state.results['with_target']['original']['fg'], 
-                    st.session_state.results['with_target']['original']['bottleneck'], 
-                    st.session_state.results['with_target']['original']['family'], 
-                    "Original"
+                    st.session_state.results['with_target']['original']['fg'],
+                    st.session_state.results['with_target']['original']['bottleneck'],
+                    st.session_state.results['with_target']['original']['family'],
+                    "Original",
                 )
                 if excel_data_orig_tgt:
                     st.download_button(
                         label="📥 Download FG to RMAT (With Target) - Original Data",
                         data=excel_data_orig_tgt,
                         file_name="FGtoRMAT(Imported+Local)Withtarget_Original.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-            
             with col2:
                 # SIT data download
                 excel_data_sit_tgt = create_excel_output_with_target(
-                    st.session_state.results['with_target']['sit']['fg'], 
-                    st.session_state.results['with_target']['sit']['bottleneck'], 
-                    st.session_state.results['with_target']['sit']['family'], 
-                    "With_SIT"
+                    st.session_state.results['with_target']['sit']['fg'],
+                    st.session_state.results['with_target']['sit']['bottleneck'],
+                    st.session_state.results['with_target']['sit']['family'],
+                    "With_SIT",
                 )
                 if excel_data_sit_tgt:
                     st.download_button(
                         label="📥 Download FG to RMAT (With Target) - With SIT Data",
                         data=excel_data_sit_tgt,
                         file_name="FGtoRMAT(Imported+Local)Withtarget_WithSIT.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
 # ==============================================================================
@@ -1424,11 +2000,28 @@ if 'simulate' in locals() and simulate:
 
     # ---- Re-run analysis WITH target using simulated data ----
     sit_suffix = "_sim"
-    sit_allocated = allocate_common_rms(sit_merged.copy(), "Total Stock", sit_suffix)
+    # Choose allocation method for simulation based on current selection
+    if allocation_method == "Equally Distribution":
+        sit_allocated = allocate_equal(sit_merged.copy(), "Total Stock", sit_suffix)
+    elif allocation_method == "Production Plan Based (Target)":
+        sit_allocated = allocate_by_target(
+            sit_merged.copy(), "Total Stock", simulated_target_plan, sit_suffix
+        )
+    else:
+        sit_allocated = allocate_by_price(sit_merged.copy(), "Total Stock", sit_suffix)
+
     family_summary_sim, bottleneck_analysis_sim, _ = run_bottleneck_analysis_with_target(
-        sit_allocated, "Total Stock", f"Allocated Stock{sit_suffix}", simulated_target_plan, sit_suffix
+        sit_allocated,
+        "Total Stock",
+        f"Allocated Stock{sit_suffix}",
+        simulated_target_plan,
+        sit_suffix,
     )
-    fg_summary_sim = create_fg_summary_view(bottleneck_analysis_sim, f"Allocated Stock{sit_suffix}", sit_suffix)
+    fg_summary_sim = create_fg_summary_view(
+        bottleneck_analysis_sim,
+        f"Allocated Stock{sit_suffix}",
+        sit_suffix,
+    )
 
     # ---- Show results ----
     st.subheader("📊 Simulated FG View Summary")
@@ -1539,10 +2132,10 @@ if not st.session_state.get("analysis_completed", False):
 **2) Select Analysis Type**
 - **With Target** · **Without Target** · **Both**
 
-**3) Date Filtering for SIT**
-- Month = **All** → no month filter  
-- Year = **All** → no year filter  
-- You can combine (e.g., **All** + **2025** → all months in 2025; **July** + **All** → every July across years)
+**3) Date Range Filter for SIT**
+- Use **Range start month/year** and **Range end month/year** to define the inclusive period for SIT data.  
+- If any of the start or end values are **All**, no date filtering will be applied (all months/years are included).  
+- For example, selecting **July 2025** as start and **September 2025** as end will include records for July, August, and September of 2025.
 
 **4) Run Analysis**
 - Click **Run Analysis** to process and build outputs
